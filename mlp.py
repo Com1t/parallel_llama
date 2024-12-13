@@ -14,6 +14,19 @@ from fairscale.nn.model_parallel.layers import (
 )
 
 # Assuming necessary functions like `get_model_parallel_rank` are defined.
+class LocalMLP(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, device):
+        super(LocalMLP, self).__init__()
+        # Standard Linear layers
+        self.linear_weight1 = torch.rand(hidden_dim, input_dim).to(device)
+        self.linear_weight2 = torch.rand(output_dim, hidden_dim).to(device)
+
+    def forward(self, x):
+        x = F.linear(x, self.linear_weight1)
+        x = F.relu(x)
+        x = F.linear(x, self.linear_weight2)
+        return x
+
 
 class ParallelMLP(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -35,20 +48,6 @@ class ParallelMLP(torch.nn.Module):
         x = self.col_parallel_layer(x)
         x = F.relu(x)
         x = self.row_parallel_layer(x)
-        return x
-
-
-class LocalMLP(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, device):
-        super(LocalMLP, self).__init__()
-        # Standard Linear layers
-        self.linear_weight1 = torch.rand(hidden_dim, input_dim).to(device)
-        self.linear_weight2 = torch.rand(output_dim, hidden_dim).to(device)
-
-    def forward(self, x):
-        x = F.linear(x, self.linear_weight1)
-        x = F.relu(x)
-        x = F.linear(x, self.linear_weight2)
         return x
 
 
@@ -75,16 +74,15 @@ def main():
     # Instantiate the parallel MLP and local MLP
     local_mlp = LocalMLP(input_dim, hidden_dim, output_dim, device)
 
+    parallel_mlp = ParallelMLP(input_dim, hidden_dim, output_dim).to(device)
+
+    # Note: Process group initialization omitted on each rank.
     weight_list1 = torch.split(local_mlp.linear_weight1,
                                local_mlp.linear_weight1.shape[0] // world_size,
                                dim=0)
     weight_list2 = torch.split(local_mlp.linear_weight2,
                                local_mlp.linear_weight2.shape[1] // world_size,
                                dim=1)
-
-    parallel_mlp = ParallelMLP(input_dim, hidden_dim, output_dim).to(device)
-
-    # Note: Process group initialization omitted on each rank.
     output_tensor = torch.zeros(hidden_dim // world_size, input_dim).to(device)
     if dist.get_rank() == 0:
         scatter_list = [t.contiguous() for t in weight_list1]
