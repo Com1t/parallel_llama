@@ -13,42 +13,140 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
 )
 
-# Assuming necessary functions like `get_model_parallel_rank` are defined.
-class LocalMLP(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, device):
-        super(LocalMLP, self).__init__()
-        # Standard Linear layers
-        self.linear_weight1 = torch.rand(hidden_dim, input_dim).to(device)
-        self.linear_weight2 = torch.rand(output_dim, hidden_dim).to(device)
+
+class LlamaMLP(torch.nn.Module):
+    def __init__(self, hidden_size, intermediate_size, mlp_bias=False, device="cpu"):
+        super(LlamaMLP, self).__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.mlp_bias = mlp_bias
+        assert self.mlp_bias is False, "model bias currently is not support"
+
+        # model weights
+        self.gate_proj = torch.rand(self.intermediate_size, self.hidden_size).to(device)
+        self.up_proj = torch.rand(self.intermediate_size, self.hidden_size).to(device)
+        self.down_proj = torch.rand(self.hidden_size, self.intermediate_size).to(device)
+
+        # model bias, currently not support
+        # if mlp_bias:
+        #     self.gate_proj_bias = torch.rand(self.intermediate_size, self.hidden_size)
+        #     self.up_proj_bias = torch.rand(self.intermediate_size, self.hidden_size)
+        #     self.down_proj_bias = torch.rand(self.hidden_size, self.intermediate_size)
 
     def forward(self, x):
-        x = F.linear(x, self.linear_weight1)
-        x = F.relu(x)
-        x = F.linear(x, self.linear_weight2)
-        return x
+        down_proj = F.linear(
+            F.silu(F.linear(x, self.gate_proj)) * F.linear(x, self.up_proj),
+            self.down_proj,
+        )
+        return down_proj
 
 
-class ParallelMLP(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(ParallelMLP, self).__init__()
+class ParallelLlamaMLP(torch.nn.Module):
+    def __init__(self, hidden_size, intermediate_size, mlp_bias=False):
+        super(ParallelLlamaMLP, self).__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.mlp_bias = mlp_bias
+        assert self.mlp_bias is False, "model bias currently is not support"
+
         # ColumnParallelLinear splits the output dimension across GPUs
-        self.col_parallel_layer = ColumnParallelLinear(
-            in_features=input_dim,
-            out_features=hidden_dim,
-            gather_output=False  # Ensures the final output is gathered across all GPUs
+        self.gate_proj = ColumnParallelLinear(
+            in_features=self.hidden_size,
+            out_features=self.intermediate_size,
+            gather_output=False,  # Ensures the final output is gathered across all GPUs
+        )
+        self.up_proj = ColumnParallelLinear(
+            in_features=self.hidden_size,
+            out_features=self.intermediate_size,
+            gather_output=False,  # Ensures the final output is gathered across all GPUs
         )
         # RowParallelLinear splits the input dimension across GPUs
-        self.row_parallel_layer = RowParallelLinear(
-            in_features=hidden_dim,
-            out_features=output_dim,
+        self.down_proj = RowParallelLinear(
+            in_features=self.intermediate_size,
+            out_features=self.hidden_size,
             input_is_parallel=True,
         )
 
+    def init_layer_weight(self, target_layer, raw_weight, world_size):
+        weight_partition_dim = [0, 0]
+        if isinstance(target_layer, ColumnParallelLinear):
+            weight_partition_dim[0] = raw_weight.shape[0] // world_size
+            weight_partition_dim[1] = raw_weight.shape[1]
+            split_dim = 0
+        elif isinstance(target_layer, RowParallelLinear):
+            weight_partition_dim[0] = raw_weight.shape[0]
+            weight_partition_dim[1] = raw_weight.shape[1] // world_size
+            split_dim = 1
+        else:
+            raise TypeError("ColumnParallelLinear or RowParallelLinear are allowed")
+
+        output_tensor = torch.zeros(
+            weight_partition_dim[0], weight_partition_dim[1]
+        ).to(target_layer.weight.device)
+
+        if dist.get_rank() == 0:
+            weight_list = torch.split(
+                raw_weight, weight_partition_dim[split_dim], dim=split_dim
+            )
+            scatter_list = [t.contiguous() for t in weight_list]
+        else:
+            scatter_list = None
+        dist.scatter(output_tensor, scatter_list, src=0)
+        target_layer.weight = torch.nn.Parameter(output_tensor)
+
+    def weight_init(self, gate_proj_weight, up_proj_weight, down_proj_weight):
+        world_size = dist.get_world_size()
+        self.init_layer_weight(self.gate_proj, gate_proj_weight, world_size)
+        self.init_layer_weight(self.up_proj, up_proj_weight, world_size)
+        self.init_layer_weight(self.down_proj, down_proj_weight, world_size)
+        # output_tensor = torch.zeros(
+        #     gate_proj_weight.shape[0] // world_size, gate_proj_weight.shape[1]
+        # ).to(self.gate_proj.weight.device)
+        # if dist.get_rank() == 0:
+        #     gate_proj_weight_list = torch.split(
+        #         gate_proj_weight, gate_proj_weight.shape[0] // world_size, dim=0
+        #     )
+        #     scatter_list = [t.contiguous() for t in gate_proj_weight_list]
+
+        # else:
+        #     scatter_list = None
+        # dist.scatter(output_tensor, scatter_list, src=0)
+        # self.gate_proj.weight = torch.nn.Parameter(output_tensor)
+
+        # output_tensor = torch.zeros(
+        #     up_proj_weight.shape[0] // world_size, up_proj_weight.shape[1]
+        # ).to(self.up_proj.weight.device)
+        # if dist.get_rank() == 0:
+        #     up_proj_weight_list = torch.split(
+        #         up_proj_weight, up_proj_weight.shape[0] // world_size, dim=0
+        #     )
+        #     scatter_list = [t.contiguous() for t in up_proj_weight_list]
+
+        # else:
+        #     scatter_list = None
+        # dist.scatter(output_tensor, scatter_list, src=0)
+        # self.up_proj.weight = torch.nn.Parameter(output_tensor)
+
+        # output_tensor = torch.zeros(
+        #     down_proj_weight.shape[0], down_proj_weight.shape[1] // world_size
+        # ).to(self.down_proj.weight.device)
+        # if dist.get_rank() == 0:
+        #     down_proj_weight_list = torch.split(
+        #         down_proj_weight, down_proj_weight.shape[1] // world_size, dim=1
+        #     )
+        #     scatter_list = [t.contiguous() for t in down_proj_weight_list]
+        # else:
+        #     scatter_list = None
+        # dist.scatter(output_tensor, scatter_list, src=0)
+        # self.down_proj.weight = torch.nn.Parameter(output_tensor)
+
     def forward(self, x):
-        x = self.col_parallel_layer(x)
-        x = F.relu(x)
-        x = self.row_parallel_layer(x)
-        return x
+        # down_proj = F.linear(
+        #     F.silu(F.linear(x, self.gate_proj)) * F.linear(x, self.up_proj),
+        #     self.down_proj,
+        # )
+        down_proj = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
 def main():
@@ -72,34 +170,12 @@ def main():
     input_tensor = input_tensor.reshape(batch_size, input_dim)
 
     # Instantiate the parallel MLP and local MLP
-    local_mlp = LocalMLP(input_dim, hidden_dim, output_dim, device)
-
-    parallel_mlp = ParallelMLP(input_dim, hidden_dim, output_dim).to(device)
-
+    local_mlp = LlamaMLP(output_dim, hidden_dim, device=device).to(device)
+    parallel_mlp = ParallelLlamaMLP(output_dim, hidden_dim).to(device)
+    parallel_mlp.weight_init(
+        local_mlp.gate_proj, local_mlp.up_proj, local_mlp.down_proj
+    )
     # Note: Process group initialization omitted on each rank.
-    weight_list1 = torch.split(local_mlp.linear_weight1,
-                               local_mlp.linear_weight1.shape[0] // world_size,
-                               dim=0)
-    weight_list2 = torch.split(local_mlp.linear_weight2,
-                               local_mlp.linear_weight2.shape[1] // world_size,
-                               dim=1)
-    output_tensor = torch.zeros(hidden_dim // world_size, input_dim).to(device)
-    if dist.get_rank() == 0:
-        scatter_list = [t.contiguous() for t in weight_list1]
-    else:
-        scatter_list = None
-    dist.scatter(output_tensor, scatter_list, src=0)
-
-    parallel_mlp.col_parallel_layer.weight = torch.nn.Parameter(output_tensor)
-
-    output_tensor = torch.zeros(input_dim, hidden_dim // world_size).to(device)
-    if dist.get_rank() == 0:
-        scatter_list = [t.contiguous() for t in weight_list2]
-    else:
-        scatter_list = None
-    dist.scatter(output_tensor, scatter_list, src=0)
-
-    parallel_mlp.row_parallel_layer.weight = torch.nn.Parameter(output_tensor)
 
     # Forward pass on GPU
     local_output = local_mlp(input_tensor)
@@ -108,12 +184,15 @@ def main():
     # Verification: Check if the outputs are close
     if rank == 0:
         if torch.allclose(parallel_output, local_output, atol=1e-5):
-            print(f"Rank {rank}: Verification passed: Parallel and local MLP outputs are close.")
+            print(
+                f"Rank {rank}: Verification passed: Parallel and local MLP outputs are close."
+            )
         else:
             print(f"Rank {rank}: Verification failed: Outputs differ significantly.")
 
         print(f"Rank {rank} Local Output:", local_output)
         print(f"Rank {rank} Parallel Output:", parallel_output)
+
 
 if __name__ == "__main__":
     main()
