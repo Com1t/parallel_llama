@@ -99,46 +99,6 @@ class ParallelLlamaMLP(torch.nn.Module):
         self.init_layer_weight(self.gate_proj, gate_proj_weight, world_size)
         self.init_layer_weight(self.up_proj, up_proj_weight, world_size)
         self.init_layer_weight(self.down_proj, down_proj_weight, world_size)
-        # output_tensor = torch.zeros(
-        #     gate_proj_weight.shape[0] // world_size, gate_proj_weight.shape[1]
-        # ).to(self.gate_proj.weight.device)
-        # if dist.get_rank() == 0:
-        #     gate_proj_weight_list = torch.split(
-        #         gate_proj_weight, gate_proj_weight.shape[0] // world_size, dim=0
-        #     )
-        #     scatter_list = [t.contiguous() for t in gate_proj_weight_list]
-
-        # else:
-        #     scatter_list = None
-        # dist.scatter(output_tensor, scatter_list, src=0)
-        # self.gate_proj.weight = torch.nn.Parameter(output_tensor)
-
-        # output_tensor = torch.zeros(
-        #     up_proj_weight.shape[0] // world_size, up_proj_weight.shape[1]
-        # ).to(self.up_proj.weight.device)
-        # if dist.get_rank() == 0:
-        #     up_proj_weight_list = torch.split(
-        #         up_proj_weight, up_proj_weight.shape[0] // world_size, dim=0
-        #     )
-        #     scatter_list = [t.contiguous() for t in up_proj_weight_list]
-
-        # else:
-        #     scatter_list = None
-        # dist.scatter(output_tensor, scatter_list, src=0)
-        # self.up_proj.weight = torch.nn.Parameter(output_tensor)
-
-        # output_tensor = torch.zeros(
-        #     down_proj_weight.shape[0], down_proj_weight.shape[1] // world_size
-        # ).to(self.down_proj.weight.device)
-        # if dist.get_rank() == 0:
-        #     down_proj_weight_list = torch.split(
-        #         down_proj_weight, down_proj_weight.shape[1] // world_size, dim=1
-        #     )
-        #     scatter_list = [t.contiguous() for t in down_proj_weight_list]
-        # else:
-        #     scatter_list = None
-        # dist.scatter(output_tensor, scatter_list, src=0)
-        # self.down_proj.weight = torch.nn.Parameter(output_tensor)
 
     def forward(self, x):
         # down_proj = F.linear(
