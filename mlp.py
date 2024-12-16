@@ -21,6 +21,7 @@ def main():
         dist.init_process_group("nccl")
     initialize_model_parallel(world_size)
 
+
     device = torch.device(f"cuda:{rank}")
 
     # Example input and configuration
