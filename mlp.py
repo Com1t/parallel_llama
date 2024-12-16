@@ -4,12 +4,13 @@ from torch import nn
 from torch.nn import functional as F
 import torch.distributed as dist
 from transformers import LlamaConfig
-
-from fairscale.nn.model_parallel.initialize import (
-    initialize_model_parallel,
-)
-
 from mlp import LlamaMLP, ParallelLlamaMLP
+
+
+def init_local_mlp_weights(local_mlp):
+    nn.init.xavier_normal_(local_mlp.gate_proj)
+    nn.init.xavier_normal_(local_mlp.up_proj)
+    nn.init.xavier_normal_(local_mlp.down_proj)
 
 
 def main():
@@ -19,17 +20,20 @@ def main():
 
     if not dist.is_initialized():
         dist.init_process_group("nccl")
-    initialize_model_parallel(world_size)
-
 
     device = torch.device(f"cuda:{rank}")
+    torch.set_default_device(device)
+    torch.set_default_dtype(torch.float16)
 
     # Example input and configuration
     batch_size = 1
     input_dim = 4096
 
-    input_tensor = torch.tensor([float(i) for i in range(input_dim)]).to(device)
-    input_tensor = input_tensor.reshape(batch_size, input_dim)
+    input_tensor = torch.zeros([batch_size, input_dim]).to(device)
+    nn.init.xavier_normal_(input_tensor)
+
+    # ensure every rank has the same input tensor
+    dist.broadcast(input_tensor, src=0)
 
     # Configuration
     cfg = LlamaConfig()
@@ -44,7 +48,8 @@ def main():
     cfg.torch_dtype = torch.float16
 
     # Instantiate the parallel MLP and local MLP
-    local_mlp = LlamaMLP(cfg, device).to(device)
+    local_mlp = LlamaMLP(cfg).to(device)
+    init_local_mlp_weights(local_mlp)
     parallel_mlp = ParallelLlamaMLP(cfg).to(device)
     parallel_mlp.weight_init(
         local_mlp.gate_proj, local_mlp.up_proj, local_mlp.down_proj

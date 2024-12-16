@@ -7,7 +7,7 @@ from transformers import LlamaConfig
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config: LlamaConfig, device="cpu"):
+    def __init__(self, config: LlamaConfig):
         super(LlamaMLP, self).__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -15,9 +15,9 @@ class LlamaMLP(nn.Module):
         assert self.mlp_bias is False, "model bias currently is not support"
 
         # model weights
-        self.gate_proj = torch.rand(self.intermediate_size, self.hidden_size).to(device)
-        self.up_proj = torch.rand(self.intermediate_size, self.hidden_size).to(device)
-        self.down_proj = torch.rand(self.hidden_size, self.intermediate_size).to(device)
+        self.gate_proj = torch.rand(self.intermediate_size, self.hidden_size)
+        self.up_proj = torch.rand(self.intermediate_size, self.hidden_size)
+        self.down_proj = torch.rand(self.hidden_size, self.intermediate_size)
 
         # model bias, currently not support
         # if mlp_bias:

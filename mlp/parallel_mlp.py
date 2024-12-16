@@ -4,7 +4,7 @@ from torch.nn import functional as F
 import torch.distributed as dist
 from transformers import LlamaConfig
 
-from fairscale.nn.model_parallel.layers import (
+from model_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
