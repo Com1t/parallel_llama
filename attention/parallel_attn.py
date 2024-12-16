@@ -1,16 +1,15 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from transformers.cache_utils import Cache
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple
 from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     LlamaRotaryEmbedding,
 )
 
-from fairscale.nn.model_parallel.layers import (
+from model_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
@@ -22,7 +21,6 @@ class ParallelLlamaAttention(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
-        device="cpu",
         layer_idx=None,
     ):
         super().__init__()

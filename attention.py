@@ -1,18 +1,16 @@
-import math
-import time
-
 import os
 import torch
 from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-from transformers import LlamaForCausalLM, LlamaConfig
-
-from fairscale.nn.model_parallel.initialize import (
-    initialize_model_parallel,
-)
-
+from transformers import LlamaConfig
 from attention import LlamaAttention, ParallelLlamaAttention
+
+
+def init_local_attn_weights(local_attn):
+    nn.init.xavier_normal_(local_attn.q_proj)
+    nn.init.xavier_normal_(local_attn.k_proj)
+    nn.init.xavier_normal_(local_attn.v_proj)
+    nn.init.xavier_normal_(local_attn.o_proj)
 
 
 def main():
@@ -22,12 +20,10 @@ def main():
 
     if not dist.is_initialized():
         dist.init_process_group("nccl")
-    initialize_model_parallel(world_size)
 
     device = torch.device(f"cuda:{rank}")
-
-    torch.set_default_dtype(torch.float16)
     torch.set_default_device(device)
+    torch.set_default_dtype(torch.float16)
 
     # Configuration
     cfg = LlamaConfig()
@@ -41,21 +37,20 @@ def main():
     cfg._attn_implementation = "sdpa"
     cfg.torch_dtype = torch.float16
 
-    model = LlamaForCausalLM(cfg).to(device)
-
     # Example input and configuration
     batch_size = 1
     seq_len = 1024
-    input_tensor = torch.rand([batch_size, seq_len, cfg.hidden_size])
+
+    input_tensor = torch.zeros([batch_size, seq_len, cfg.hidden_size])
+    nn.init.xavier_normal_(input_tensor)
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_tensor.shape[0], -1)
+
+    # ensure every rank has the same input tensor
     dist.broadcast(input_tensor, src=0)
 
-    # Instantiate the parallel MLP and local MLP
+    # Instantiate the parallel attn and local attn
     local_attn = LlamaAttention(cfg).to(device)
-    local_attn.q_proj = model.model.layers[0].self_attn.q_proj.weight
-    local_attn.k_proj = model.model.layers[0].self_attn.k_proj.weight
-    local_attn.v_proj = model.model.layers[0].self_attn.v_proj.weight
-    local_attn.o_proj = model.model.layers[0].self_attn.o_proj.weight
+    init_local_attn_weights(local_attn)
 
     parallel_attn = ParallelLlamaAttention(cfg).to(device)
     parallel_attn.weight_init(
