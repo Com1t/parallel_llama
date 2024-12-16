@@ -1,7 +1,6 @@
 import os
 import torch
 from torch import nn
-from torch.nn import functional as F
 import torch.distributed as dist
 from transformers import LlamaConfig
 from mlp import LlamaMLP, ParallelLlamaMLP
@@ -25,16 +24,6 @@ def main():
     torch.set_default_device(device)
     torch.set_default_dtype(torch.float16)
 
-    # Example input and configuration
-    batch_size = 1
-    input_dim = 4096
-
-    input_tensor = torch.zeros([batch_size, input_dim]).to(device)
-    nn.init.xavier_normal_(input_tensor)
-
-    # ensure every rank has the same input tensor
-    dist.broadcast(input_tensor, src=0)
-
     # Configuration
     cfg = LlamaConfig()
     cfg.hidden_size = 4096
@@ -47,9 +36,20 @@ def main():
     cfg._attn_implementation = "sdpa"
     cfg.torch_dtype = torch.float16
 
+    # Example input and configuration
+    batch_size = 1
+    input_dim = cfg.hidden_size
+
+    input_tensor = torch.zeros([batch_size, input_dim])
+    nn.init.xavier_normal_(input_tensor)
+
+    # ensure every rank has the same input tensor
+    dist.broadcast(input_tensor, src=0)
+
     # Instantiate the parallel MLP and local MLP
     local_mlp = LlamaMLP(cfg).to(device)
     init_local_mlp_weights(local_mlp)
+
     parallel_mlp = ParallelLlamaMLP(cfg).to(device)
     parallel_mlp.weight_init(
         local_mlp.gate_proj, local_mlp.up_proj, local_mlp.down_proj
