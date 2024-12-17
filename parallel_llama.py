@@ -6,6 +6,7 @@ from torch import nn
 import torch.distributed as dist
 from transformers import LlamaConfig
 from modeling_llama import LlamaForCausalLM
+from modeling_parallel_llama import ParallelLlamaForCausalLM
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -32,7 +33,14 @@ def init_prof(use_profiler):
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda:0")
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["LOCAL_RANK"])
+
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+
+    device = torch.device(f"cuda:{rank}")
     torch.set_default_device(device)
     torch.set_default_dtype(torch.float16)
 
@@ -47,7 +55,9 @@ if __name__ == "__main__":
     cfg._attn_implementation = "sdpa"
     cfg.torch_dtype = torch.float16
 
-    model = LlamaForCausalLM(cfg).to(device)
+    # if rank == 0:
+    #     model = LlamaForCausalLM(cfg).to(device)
+    parallel_model = ParallelLlamaForCausalLM(cfg).to(device)
     print(
         f"After init model, CUDA memory allocated: {torch.cuda.memory_allocated(device) / 1024 ** 3:.2f} GB, reserved: {torch.cuda.memory_reserved(device) / 1024 ** 3:.2f} GB"
     )
@@ -56,7 +66,7 @@ if __name__ == "__main__":
     batch_size = 1
     seq_len = 4096
 
-    vocab_size = model.config.vocab_size
+    vocab_size = parallel_model.config.vocab_size
     inputs_embeds = torch.zeros([batch_size, seq_len, cfg.hidden_size])
     nn.init.xavier_normal_(inputs_embeds)
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
@@ -76,10 +86,10 @@ if __name__ == "__main__":
                 if step > warmup_num_iterations:
                     start_time = time.time()
                 with torch.no_grad():
-                    outputs = model(
+                    outputs = parallel_model(
                         inputs_embeds=inputs_embeds,
                         position_ids=position_ids,
-                        num_logits_to_keep=1
+                        num_logits_to_keep=1,
                     )
 
                 print(
@@ -96,4 +106,15 @@ if __name__ == "__main__":
                 if use_profiler:
                     prof.step()
 
-    print(f"time for local attention: {elapse / num_iterations * 1000:.3f} ms")
+    print(f"time for parallel attention: {elapse / num_iterations * 1000:.3f} ms")
+    # Reduce the maximum parallel time to rank 0
+    elapse_time_tensor = torch.tensor(elapse, device=device)
+    dist.reduce(elapse_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_elapse_time = elapse_time_tensor.item()
+        print(
+            f"Max parallel attention time: {max_elapse_time / num_iterations * 1000:.3f} ms"
+        )
+
+    dist.barrier()
+    dist.destroy_process_group()

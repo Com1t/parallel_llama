@@ -30,15 +30,15 @@ from attention import LlamaAttention, ParallelLlamaAttention
 from mlp import LlamaMLP, ParallelLlamaMLP
 
 
-class LlamaDecoderLayer(nn.Module):
+class ParallelLlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = ParallelLlamaAttention(config=config, layer_idx=layer_idx)
 
-        self.mlp = LlamaMLP(config)
+        self.mlp = ParallelLlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -117,7 +117,7 @@ class LlamaDecoderLayer(nn.Module):
         return outputs
 
 
-class LlamaModel(nn.Module):
+class ParallelLlamaModel(nn.Module):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -136,7 +136,7 @@ class LlamaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, layer_idx)
+                ParallelLlamaDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -146,13 +146,13 @@ class LlamaModel(nn.Module):
 
     def init_weights(self):
         for layer in self.layers:
-            nn.init.xavier_normal_(layer.self_attn.q_proj)
-            nn.init.xavier_normal_(layer.self_attn.k_proj)
-            nn.init.xavier_normal_(layer.self_attn.v_proj)
-            nn.init.xavier_normal_(layer.self_attn.o_proj)
-            nn.init.xavier_normal_(layer.mlp.gate_proj)
-            nn.init.xavier_normal_(layer.mlp.up_proj)
-            nn.init.xavier_normal_(layer.mlp.down_proj)
+            nn.init.xavier_normal_(layer.self_attn.q_proj.weight)
+            nn.init.xavier_normal_(layer.self_attn.k_proj.weight)
+            nn.init.xavier_normal_(layer.self_attn.v_proj.weight)
+            nn.init.xavier_normal_(layer.self_attn.o_proj.weight)
+            nn.init.xavier_normal_(layer.mlp.gate_proj.weight)
+            nn.init.xavier_normal_(layer.mlp.up_proj.weight)
+            nn.init.xavier_normal_(layer.mlp.down_proj.weight)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -232,11 +232,11 @@ class LlamaModel(nn.Module):
 
         return hidden_states, next_cache
 
-class LlamaForCausalLM(nn.Module):
+class ParallelLlamaForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.model = LlamaModel(config)
+        self.model = ParallelLlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
