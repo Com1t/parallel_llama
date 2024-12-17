@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -56,10 +57,38 @@ def main():
     )
     # Note: Process group initialization omitted on each rank.
 
-    # Forward pass on GPU
+    # warmup
     with torch.no_grad():
         local_output = local_mlp(input_tensor)
         parallel_output = parallel_mlp(input_tensor)
+
+    # Forward pass on GPU
+    with torch.no_grad():
+        if rank == 0:
+            torch.cuda.synchronize()
+            start_time = time.time()
+            local_output = local_mlp(input_tensor)
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            local_time = end_time - start_time
+            print(f"time for local MLP: {local_time * 1000:.3} ms")
+
+        torch.cuda.synchronize()
+        start_time = time.time()
+        parallel_output = parallel_mlp(input_tensor)
+        torch.cuda.synchronize()
+        end_time = time.time()
+
+        parallel_time = end_time - start_time
+        print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
+
+        # Reduce the maximum parallel time to rank 0
+        parallel_time_tensor = torch.tensor(parallel_time, device=device)
+        dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+        if rank == 0:
+            max_parallel_time = parallel_time_tensor.item()
+            print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
 
     # Verification: Check if the outputs are close
     if rank == 0:
@@ -73,6 +102,7 @@ def main():
         print(f"Rank {rank} Local Output:", local_output)
         print(f"Rank {rank} Parallel Output:", parallel_output)
 
+    dist.barrier()
     dist.destroy_process_group()
 
 
