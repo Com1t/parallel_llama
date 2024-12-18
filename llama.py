@@ -6,6 +6,7 @@ from torch import nn
 import torch.distributed as dist
 from transformers import LlamaConfig
 from modeling_llama import LlamaForCausalLM
+from transformers.cache_utils import DynamicCache
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -55,16 +56,15 @@ if __name__ == "__main__":
     # Example input and configuration
     batch_size = 1
     seq_len = 4096
-
-    vocab_size = model.config.vocab_size
-    inputs_embeds = torch.zeros([batch_size, seq_len, cfg.hidden_size])
-    nn.init.xavier_normal_(inputs_embeds)
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+    vocab_size = cfg.vocab_size
 
     with torch.no_grad():
         use_profiler = True
         num_iterations = 10
         warmup_num_iterations = 2
+
+        generate_num_tokens = 10
+
         print(
             f"During infer, CUDA memory allocated: {torch.cuda.memory_allocated(device) / 1024 ** 3:.2f} GB, reserved: {torch.cuda.memory_reserved(device) / 1024 ** 3:.2f} GB"
         )
@@ -75,12 +75,37 @@ if __name__ == "__main__":
             for step in range(num_iterations):
                 if step > warmup_num_iterations:
                     start_time = time.time()
-                with torch.no_grad():
-                    outputs = model(
-                        inputs_embeds=inputs_embeds,
-                        position_ids=position_ids,
-                        num_logits_to_keep=1
-                    )
+
+                input_ids = torch.randint(vocab_size, (batch_size, seq_len))
+                position_ids = (
+                    torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+                )
+                past_key_values = DynamicCache()
+                for i in range(generate_num_tokens):
+                    torch.cuda.synchronize()
+                    per_itr_start_time = time.time()
+                    with torch.no_grad():
+                        logits, outputs, past_key_values = model(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            num_logits_to_keep=1,
+                            use_cache=True,
+                            past_key_values=past_key_values,
+                        )
+                    torch.cuda.synchronize()
+                    per_itr_end_time = time.time()
+                    per_itr_elapse_time = per_itr_end_time - per_itr_start_time
+                    if i == 0:
+                        print(f"time for prefill: {per_itr_elapse_time * 1000:.3f} ms")
+                    else:
+                        print(f"time for decode: {per_itr_elapse_time * 1000:.3f} ms")
+
+                    # Update position_ids
+                    next_position_id = position_ids[:, -1] + 1
+                    position_ids = next_position_id.unsqueeze(1)
+
+                    # Get the next input token
+                    input_ids = torch.argmax(logits, dim=2).reshape(batch_size, -1)
 
                 print(
                     f"step {step} CUDA memory allocated/reserved: {torch.cuda.memory_allocated(device) / 1024 ** 3:.2f}/{torch.cuda.memory_reserved(device) / 1024 ** 3:.2f} GB"
@@ -89,9 +114,6 @@ if __name__ == "__main__":
                 if step > warmup_num_iterations:
                     end_time = time.time()
                     elapse += end_time - start_time
-
-                if step >= num_iterations:
-                    break
 
                 if use_profiler:
                     prof.step()
