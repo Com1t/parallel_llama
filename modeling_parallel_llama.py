@@ -145,6 +145,7 @@ class ParallelLlamaModel(nn.Module):
         self.init_weights()
 
     def init_weights(self):
+        nn.init.xavier_normal_(self.embed_tokens.weight)
         for layer in self.layers:
             nn.init.xavier_normal_(layer.self_attn.q_proj.weight)
             nn.init.xavier_normal_(layer.self_attn.k_proj.weight)
