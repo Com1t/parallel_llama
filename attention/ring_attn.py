@@ -10,7 +10,8 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
 )
 
-from xformers.ops.fmha import memory_efficient_attention_partial
+from xformers.ops.fmha import memory_efficient_attention_partial, merge_attentions
+from .utils import RingComm
 
 
 class RingLlamaAttention(nn.Module):
@@ -48,11 +49,88 @@ class RingLlamaAttention(nn.Module):
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
-    def next_rank(self, rank, total_ranks):
-        return (rank + 1) % total_ranks
+    def seq_parallel_send_q(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        process_group = dist.group.WORLD
+        comm = RingComm(process_group)
+        world_size = comm.world_size
 
-    def prev_rank(self, rank, total_ranks):
-        return (rank - 1) % total_ranks
+        next_q = None
+
+        o_blocks = []
+        lse_values = []
+        for step in range(world_size):
+            if step + 1 != comm.world_size:
+                next_q: torch.Tensor = comm.send_recv(q)
+                comm.commit()
+
+            out_, lse_ = memory_efficient_attention_partial(q, k, v)
+
+            # attn_out is in the shape of [B, M, num of heads, head_dim]
+            o_blocks.append(out_)
+
+            # LSE is in the shape of [B, num of heads, M]
+            lse_values.append(lse_)
+
+            if step + 1 != comm.world_size:
+                comm.wait()
+                q = next_q
+
+        # shuffle recv and lse values
+        recv_buf = [torch.zeros_like(temp) for temp in o_blocks]
+        dist.all_to_all(recv_buf, o_blocks)
+        o_blocks = recv_buf
+        recv_buf = [torch.zeros_like(temp) for temp in lse_values]
+        dist.all_to_all(recv_buf, lse_values)
+        lse_values = recv_buf
+
+        with torch.cuda.device(q.device.index):
+            attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+
+        return attn_output
+
+    def seq_parallel_send_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        process_group = dist.group.WORLD
+        comm = RingComm(process_group)
+        world_size = comm.world_size
+
+        next_k, next_v = None, None
+
+        o_blocks = []
+        lse_values = []
+        for step in range(world_size):
+            if step + 1 != comm.world_size:
+                next_k: torch.Tensor = comm.send_recv(k)
+                next_v: torch.Tensor = comm.send_recv(v)
+                comm.commit()
+
+            out_, lse_ = memory_efficient_attention_partial(q, k, v)
+
+            # attn_out is in the shape of [B, M, num of heads, head_dim]
+            o_blocks.append(out_)
+
+            # LSE is in the shape of [B, num of heads, M]
+            lse_values.append(lse_)
+            # print(f"once {torch.cuda.max_memory_allocated() / 1024**2} MB")
+
+            if step + 1 != comm.world_size:
+                comm.wait()
+                k = next_k
+                v = next_v
+
+        with torch.cuda.device(q.device.index):
+            attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+
+        return attn_output
 
     def forward(
         self,
@@ -103,67 +181,13 @@ class RingLlamaAttention(nn.Module):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        local_rank = dist.get_rank()
-        world_size = dist.get_world_size()
+        # attn_output = self.seq_parallel_send_q(
+        #     q=query_states, k=key_states, v=value_states
+        # )
+        attn_output = self.seq_parallel_send_kv(
+            q=query_states, k=key_states, v=value_states
+        )
 
-        send_to = self.next_rank(local_rank, world_size)
-        receive_from = self.prev_rank(local_rank, world_size)
-
-        outs, max_lse = None, None
-        new_denominator = None
-        attn_output = None
-        new_lse_full = None
-        dist.barrier()
-        for step in range(world_size):
-            recv_k = torch.zeros_like(key_states)
-            send_req = dist.P2POp(dist.isend, key_states, peer=send_to)
-            recv_req = dist.P2POp(dist.irecv, recv_k, peer=receive_from)
-            reqs = dist.batch_isend_irecv([send_req, recv_req])
-            for req in reqs:
-                req.wait()
-
-            recv_v = torch.zeros_like(value_states)
-            send_req = dist.P2POp(dist.isend, value_states, peer=send_to)
-            recv_req = dist.P2POp(dist.irecv, recv_v, peer=receive_from)
-            reqs = dist.batch_isend_irecv([send_req, recv_req])
-            for req in reqs:
-                req.wait()
-
-            out_, lse_ = memory_efficient_attention_partial(
-                query_states, recv_k, recv_v
-            )
-            lse_ = lse_.transpose(1, 2)
-
-            if max_lse is None:
-                max_lse = lse_
-                adjust_factors = torch.ones_like(lse_).unsqueeze(-1)
-                new_denominator = adjust_factors
-                attn_output = out_ * adjust_factors
-
-                new_lse_full = lse_
-
-            else:
-                new_max_lse = torch.maximum(max_lse, lse_)
-
-                old_adjust_factors = torch.exp(max_lse - new_max_lse).unsqueeze(-1)
-                new_adjust_factors = torch.exp(lse_ - new_max_lse).unsqueeze(-1)
-
-                new_denominator = (
-                    old_adjust_factors * new_denominator + new_adjust_factors
-                )
-                attn_output = (
-                    old_adjust_factors * attn_output + new_adjust_factors * out_
-                )
-
-                new_lse_full = new_max_lse + torch.log(
-                    torch.exp(new_lse_full - new_max_lse)
-                    + torch.exp(lse_ - new_max_lse)
-                )
-
-                max_lse = new_max_lse
-
-        attn_output = attn_output / new_denominator
-        attn_output = attn_output.contiguous().half()
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = F.linear(attn_output, self.o_proj)
