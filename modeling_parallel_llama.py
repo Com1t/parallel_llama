@@ -233,6 +233,7 @@ class ParallelLlamaModel(nn.Module):
 
         return hidden_states, next_cache
 
+
 class ParallelLlamaForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()

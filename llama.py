@@ -58,13 +58,14 @@ if __name__ == "__main__":
     seq_len = 4096
     vocab_size = cfg.vocab_size
 
+    use_profiler = True
+    num_iterations = 10
+    num_warmup_iterations = 2
+    num_inf_iterations = num_iterations - num_warmup_iterations
+
+    num_generate_tokens = 10
+
     with torch.no_grad():
-        use_profiler = True
-        num_iterations = 10
-        warmup_num_iterations = 2
-
-        generate_num_tokens = 10
-
         print(
             f"During infer, CUDA memory allocated: {torch.cuda.memory_allocated(device) / 1024 ** 3:.2f} GB, reserved: {torch.cuda.memory_reserved(device) / 1024 ** 3:.2f} GB"
         )
@@ -73,17 +74,23 @@ if __name__ == "__main__":
         with ctx as prof:
             elapse = 0.0
             for step in range(num_iterations):
-                if step > warmup_num_iterations:
+                if step >= num_warmup_iterations:
+                    torch.cuda.synchronize()
                     start_time = time.time()
 
                 input_ids = torch.randint(vocab_size, (batch_size, seq_len))
                 position_ids = (
                     torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
                 )
+
+                prefill_time = 0.0
+                decoding_time = 0.0
                 past_key_values = DynamicCache()
-                for i in range(generate_num_tokens):
-                    torch.cuda.synchronize()
-                    per_itr_start_time = time.time()
+                for i_tk in range(num_generate_tokens):
+                    if step >= num_warmup_iterations:
+                        torch.cuda.synchronize()
+                        itr_start_time = time.time()
+
                     with torch.no_grad():
                         logits, outputs, past_key_values = model(
                             input_ids=input_ids,
@@ -92,13 +99,15 @@ if __name__ == "__main__":
                             use_cache=True,
                             past_key_values=past_key_values,
                         )
-                    torch.cuda.synchronize()
-                    per_itr_end_time = time.time()
-                    per_itr_elapse_time = per_itr_end_time - per_itr_start_time
-                    if i == 0:
-                        print(f"time for prefill: {per_itr_elapse_time * 1000:.3f} ms")
-                    else:
-                        print(f"time for decode: {per_itr_elapse_time * 1000:.3f} ms")
+
+                    if step >= num_warmup_iterations:
+                        torch.cuda.synchronize()
+                        itr_end_time = time.time()
+                        itr_elapse_time = itr_end_time - itr_start_time
+                        if i_tk == 0:
+                            prefill_time = itr_elapse_time
+                        else:
+                            decoding_time += itr_elapse_time
 
                     # Update position_ids
                     next_position_id = position_ids[:, -1] + 1
@@ -111,11 +120,13 @@ if __name__ == "__main__":
                     f"step {step} CUDA memory allocated/reserved: {torch.cuda.memory_allocated(device) / 1024 ** 3:.2f}/{torch.cuda.memory_reserved(device) / 1024 ** 3:.2f} GB"
                 )
 
-                if step > warmup_num_iterations:
+                if step > num_warmup_iterations:
                     end_time = time.time()
                     elapse += end_time - start_time
+                    print(f"time for prefill: {prefill_time * 1000:.3f} ms")
+                    print(f"time for decode: {decoding_time * 1000:.3f} ms")
 
                 if use_profiler:
                     prof.step()
 
-    print(f"time for local attention: {elapse / num_iterations * 1000:.3f} ms")
+    print(f"time for local attention: {elapse / num_inf_iterations * 1000:.3f} ms")

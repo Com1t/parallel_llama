@@ -233,6 +233,7 @@ class LlamaModel(nn.Module):
 
         return hidden_states, next_cache
 
+
 class LlamaForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
