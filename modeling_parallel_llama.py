@@ -29,6 +29,8 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from attention import LlamaAttention, ParallelLlamaAttention
 from mlp import LlamaMLP, ParallelLlamaMLP
 
+import time
+import torch.distributed as dist
 
 class ParallelLlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -43,6 +45,10 @@ class ParallelLlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        
+        self.attn_time = 0.0
+        self.mlp_time = 0.0
+        self.layernorm_time = 0.0
 
     def forward(
         self,
@@ -84,8 +90,14 @@ class ParallelLlamaDecoderLayer(nn.Module):
         """
         residual = hidden_states
 
+        torch.cuda.synchronize()
+        start_time = time.time()
         hidden_states = self.input_layernorm(hidden_states)
+        torch.cuda.synchronize()
+        self.layernorm_time = time.time() - start_time
 
+        torch.cuda.synchronize()
+        start_time = time.time()
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -98,12 +110,25 @@ class ParallelLlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        torch.cuda.synchronize()
+        self.attn_time = time.time() - start_time
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
+        torch.cuda.synchronize()
+        start_time = time.time()
         hidden_states = self.post_attention_layernorm(hidden_states)
+        torch.cuda.synchronize()
+        self.layernorm_time = time.time() - start_time
+
+        torch.cuda.synchronize()
+        start_time = time.time()
         hidden_states = self.mlp(hidden_states)
+        torch.cuda.synchronize()
+        self.mlp_time = time.time() - start_time
+
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -210,6 +235,10 @@ class ParallelLlamaModel(nn.Module):
         # decoder layers
         next_decoder_cache = None
 
+        attn_time = 0.0
+        mlp_time = 0.0
+        layer_norm_time = 0.0
+
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -220,10 +249,17 @@ class ParallelLlamaModel(nn.Module):
                 cache_position=cache_position,
             )
 
+            attn_time += decoder_layer.attn_time
+            mlp_time += decoder_layer.mlp_time
+            layer_norm_time += decoder_layer.layernorm_time
             hidden_states = layer_outputs[0]
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+        rank = dist.get_rank()
+        if rank == 0:
+            print(f"attn_time: {attn_time * 1000:.3} ms, mlp_time: {mlp_time * 1000:.3} ms, layer_norm_time: {layer_norm_time * 1000:.3} ms")
 
         hidden_states = self.norm(hidden_states)
 

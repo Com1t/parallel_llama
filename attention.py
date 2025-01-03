@@ -59,13 +59,42 @@ def main():
     )
 
     # warmup
-    with torch.no_grad():
-        local_output, _, _ = local_attn(input_tensor, position_ids=position_ids)
-        parallel_output, _, _ = parallel_attn(input_tensor, position_ids=position_ids)
+    num_warmup_runs = 10
+    for _ in range(num_warmup_runs):
+        with torch.no_grad():
+            local_output, _, _ = local_attn(input_tensor, position_ids=position_ids)
+            parallel_output, _, _ = parallel_attn(
+                input_tensor, position_ids=position_ids
+            )
+    dist.barrier()
 
     # Forward pass on GPU
-    with torch.no_grad():
-        if rank == 0:
+    num_runs = 20
+    parallel_time = 0.0
+    for _ in range(num_runs):
+        dist.barrier()
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            start_time = time.time()
+            parallel_output, _, _ = parallel_attn(
+                input_tensor, position_ids=position_ids
+            )
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            parallel_time += end_time - start_time
+    parallel_time /= num_runs
+    print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
+
+    # Reduce the maximum parallel time to rank 0
+    parallel_time_tensor = torch.tensor(parallel_time, device=device)
+    dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_parallel_time = parallel_time_tensor.item()
+        print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
+
+    if rank == 0:
+        with torch.no_grad():
             torch.cuda.synchronize()
             start_time = time.time()
             local_output, _, _ = local_attn(input_tensor, position_ids=position_ids)
@@ -74,22 +103,6 @@ def main():
 
             local_time = end_time - start_time
             print(f"time for local attention: {local_time * 1000:.3} ms")
-
-        torch.cuda.synchronize()
-        start_time = time.time()
-        parallel_output, _, _ = parallel_attn(input_tensor, position_ids=position_ids)
-        torch.cuda.synchronize()
-        end_time = time.time()
-
-        parallel_time = end_time - start_time
-        print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
-
-        # Reduce the maximum parallel time to rank 0
-        parallel_time_tensor = torch.tensor(parallel_time, device=device)
-        dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            max_parallel_time = parallel_time_tensor.item()
-            print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
 
     # Verification: Check if the outputs are close
     if rank == 0:

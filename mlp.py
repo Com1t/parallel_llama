@@ -39,9 +39,10 @@ def main():
 
     # Example input and configuration
     batch_size = 1
+    seq_len = 4096
     input_dim = cfg.hidden_size
 
-    input_tensor = torch.zeros([batch_size, input_dim])
+    input_tensor = torch.zeros([batch_size, seq_len, input_dim])
     nn.init.xavier_normal_(input_tensor)
 
     # ensure every rank has the same input tensor
@@ -58,13 +59,38 @@ def main():
     # Note: Process group initialization omitted on each rank.
 
     # warmup
-    with torch.no_grad():
-        local_output = local_mlp(input_tensor)
-        parallel_output = parallel_mlp(input_tensor)
+    num_warmup_runs = 10
+    for _ in range(num_warmup_runs):
+        with torch.no_grad():
+            local_output = local_mlp(input_tensor)
+            parallel_output = parallel_mlp(input_tensor)
+    dist.barrier()
 
     # Forward pass on GPU
-    with torch.no_grad():
-        if rank == 0:
+    num_runs = 20
+    parallel_time = 0.0
+    for _ in range(num_runs):
+        dist.barrier()
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            start_time = time.time()
+            parallel_output = parallel_mlp(input_tensor)
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            parallel_time += end_time - start_time
+    parallel_time /= num_runs
+    print(f"Rank {rank}: time for parallel MLP: {parallel_time * 1000:.3} ms")
+
+    # Reduce the maximum parallel time to rank 0
+    parallel_time_tensor = torch.tensor(parallel_time, device=device)
+    dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_parallel_time = parallel_time_tensor.item()
+        print(f"Max parallel MLP time: {max_parallel_time * 1000:.3} ms")
+
+    if rank == 0:
+        with torch.no_grad():
             torch.cuda.synchronize()
             start_time = time.time()
             local_output = local_mlp(input_tensor)
@@ -73,22 +99,6 @@ def main():
 
             local_time = end_time - start_time
             print(f"time for local MLP: {local_time * 1000:.3} ms")
-
-        torch.cuda.synchronize()
-        start_time = time.time()
-        parallel_output = parallel_mlp(input_tensor)
-        torch.cuda.synchronize()
-        end_time = time.time()
-
-        parallel_time = end_time - start_time
-        print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
-
-        # Reduce the maximum parallel time to rank 0
-        parallel_time_tensor = torch.tensor(parallel_time, device=device)
-        dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            max_parallel_time = parallel_time_tensor.item()
-            print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
 
     # Verification: Check if the outputs are close
     if rank == 0:
@@ -99,8 +109,8 @@ def main():
         else:
             print(f"Rank {rank}: Verification failed: Outputs differ significantly.")
 
-        print(f"Rank {rank} Local Output:", local_output)
-        print(f"Rank {rank} Parallel Output:", parallel_output)
+        # print(f"Rank {rank} Local Output:", local_output)
+        # print(f"Rank {rank} Parallel Output:", parallel_output)
 
     dist.barrier()
     dist.destroy_process_group()
