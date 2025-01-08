@@ -40,7 +40,7 @@ def main():
 
     # Example input and configuration
     batch_size = 1
-    for seq_len in [1024, 2048, 4096, 8192]:
+    for seq_len in [4096]:
         input_tensor = torch.zeros([batch_size, seq_len, cfg.hidden_size])
         nn.init.xavier_normal_(input_tensor)
         position_ids = (

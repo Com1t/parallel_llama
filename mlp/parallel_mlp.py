@@ -9,6 +9,8 @@ from model_parallel.layers import (
     RowParallelLinear,
 )
 
+import nvtx
+
 
 class ParallelLlamaMLP(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -75,5 +77,10 @@ class ParallelLlamaMLP(nn.Module):
         #     F.silu(F.linear(x, self.gate_proj)) * F.linear(x, self.up_proj),
         #     self.down_proj,
         # )
+        mlp_rng = nvtx.start_range(message="MLP", color="violet")
+
         down_proj = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        nvtx.end_range(mlp_rng)
+
         return down_proj

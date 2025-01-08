@@ -14,6 +14,8 @@ from model_parallel.layers import (
     RowParallelLinear,
 )
 
+import nvtx
+
 
 class ParallelLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -112,16 +114,24 @@ class ParallelLlamaAttention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ):
+        attn_rng = nvtx.start_range(message="tp attn", color="red")
+
         bsz, q_len, _ = hidden_states.size()
+
+        qkv_rng = nvtx.start_range(message="tp qkv projection", color="blue")
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        nvtx.end_range(qkv_rng)
+
         # use -1 to infer num_heads and num_key_value_heads as they may vary if tensor parallel is used
         query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        pos_rng = nvtx.start_range(message="tp pos embedding", color="orange")
 
         if position_embeddings is None:
             cos, sin = self.rotary_emb(value_states, position_ids)
@@ -138,6 +148,8 @@ class ParallelLlamaAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
+        nvtx.end_range(pos_rng)
+
         # TODO
         # key_states = repeat_kv(key_states, self.num_key_value_groups)
         # value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -149,6 +161,8 @@ class ParallelLlamaAttention(nn.Module):
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        sdpa_rng = nvtx.start_range(message="tp sdpa", color="green")
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -156,9 +170,17 @@ class ParallelLlamaAttention(nn.Module):
             is_causal=self.is_causal,
         )
 
+        nvtx.end_range(sdpa_rng)
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
 
+        o_rng = nvtx.start_range(message="tp o projection", color="gray")
+
         attn_output = self.o_proj(attn_output)
+
+        nvtx.end_range(o_rng)
+
+        nvtx.end_range(attn_rng)
 
         return attn_output, None, past_key_value

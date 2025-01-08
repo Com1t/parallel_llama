@@ -40,6 +40,8 @@ from .mappings import (
 )
 from .utils import divide_and_check_no_remainder
 
+import nvtx
+
 
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
@@ -102,12 +104,23 @@ class ColumnParallelLinear(torch.nn.Module):
         # Set up backprop all-reduce.
         input_parallel = copy_to_model_parallel_region(input_)
         # Matrix multiply.
+        matmul_rng = nvtx.start_range(message="Matmul", color="yellow")
+
         output_parallel = F.linear(input_parallel, self.weight, self.bias)
+
+        nvtx.end_range(matmul_rng)
+
+        col_comm_rng = nvtx.start_range(message="Matmul", color="brown")
+
+        input_parallel = copy_to_model_parallel_region(input_)
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_model_parallel_region(output_parallel)
         else:
             output = output_parallel
+
+        nvtx.end_range(col_comm_rng)
+
         return output
 
 
@@ -181,11 +194,21 @@ class RowParallelLinear(torch.nn.Module):
         else:
             input_parallel = scatter_to_model_parallel_region(input_)
         # Matrix multiply.
+        matmul_rng = nvtx.start_range(message="Matmul", color="yellow")
+
         output_parallel = F.linear(input_parallel, self.weight)
+
+        nvtx.end_range(matmul_rng)
+
+        row_comm_rng = nvtx.start_range(message="Row Comm", color="brown")
+
         # All-reduce across all the partitions.
         output_ = reduce_from_model_parallel_region(output_parallel)
         if self.bias is not None:
             output = output_ + self.bias
         else:
             output = output_
+
+        nvtx.end_range(row_comm_rng)
+
         return output

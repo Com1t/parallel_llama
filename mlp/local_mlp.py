@@ -5,6 +5,8 @@ from torch.nn import functional as F
 import torch.distributed as dist
 from transformers import LlamaConfig
 
+import nvtx
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -26,8 +28,13 @@ class LlamaMLP(nn.Module):
         #     self.down_proj_bias = torch.rand(self.hidden_size, self.intermediate_size)
 
     def forward(self, x):
+        mlp_rng = nvtx.start_range(message="MLP", color="violet")
+
         down_proj = F.linear(
             F.silu(F.linear(x, self.gate_proj)) * F.linear(x, self.up_proj),
             self.down_proj,
         )
+
+        nvtx.end_range(mlp_rng)
+
         return down_proj

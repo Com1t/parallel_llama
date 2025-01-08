@@ -13,6 +13,8 @@ from transformers.models.llama.modeling_llama import (
 from xformers.ops.fmha import memory_efficient_attention_partial, merge_attentions
 from .utils import RingComm
 
+import nvtx
+
 
 class RingLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -108,12 +110,22 @@ class RingLlamaAttention(nn.Module):
         o_blocks = []
         lse_values = []
         for step in range(world_size):
+            seq_attn_rng = nvtx.start_range(
+                message=f"seq attn step {step}", color="pink"
+            )
+
             if step + 1 != comm.world_size:
                 next_k: torch.Tensor = comm.send_recv(k)
                 next_v: torch.Tensor = comm.send_recv(v)
                 comm.commit()
 
+            seq_sdpa_rng = nvtx.start_range(message="sdpa", color="white")
+
             out_, lse_ = memory_efficient_attention_partial(q, k, v)
+
+            nvtx.end_range(seq_sdpa_rng)
+
+            seq_cache_rng = nvtx.start_range(message="cache append", color="cyan")
 
             # attn_out is in the shape of [B, M, num of heads, head_dim]
             o_blocks.append(out_)
@@ -122,13 +134,21 @@ class RingLlamaAttention(nn.Module):
             lse_values.append(lse_)
             # print(f"once {torch.cuda.max_memory_allocated() / 1024**2} MB")
 
+            nvtx.end_range(seq_cache_rng)
+
             if step + 1 != comm.world_size:
                 comm.wait()
                 k = next_k
                 v = next_v
 
+            nvtx.end_range(seq_attn_rng)
+
         with torch.cuda.device(q.device.index):
+            seq_merge_rng = nvtx.start_range(message="seq attn merging", color="brown")
+
             attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+
+            nvtx.end_range(seq_merge_rng)
 
         return attn_output
 
@@ -146,16 +166,24 @@ class RingLlamaAttention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ):
+        attn_rng = nvtx.start_range(message="attn", color="red")
+
         bsz, q_len, _ = hidden_states.size()
+
+        qkv_rng = nvtx.start_range(message="qkv projection", color="blue")
 
         query_states = F.linear(hidden_states, self.q_proj)
         key_states = F.linear(hidden_states, self.k_proj)
         value_states = F.linear(hidden_states, self.v_proj)
 
+        nvtx.end_range(qkv_rng)
+
         # use -1 to infer num_heads and num_key_value_heads as they may vary if tensor parallel is used
         query_states = query_states.view(bsz, q_len, -1, self.head_dim)
         key_states = key_states.view(bsz, q_len, -1, self.head_dim)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim)
+
+        pos_rng = nvtx.start_range(message="pos embedding", color="orange")
 
         if position_embeddings is None:
             cos, sin = self.rotary_emb(value_states, position_ids)
@@ -164,6 +192,8 @@ class RingLlamaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=2
         )
+
+        nvtx.end_range(pos_rng)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -184,12 +214,22 @@ class RingLlamaAttention(nn.Module):
         # attn_output = self.seq_parallel_send_q(
         #     q=query_states, k=key_states, v=value_states
         # )
+        seq_rng = nvtx.start_range(message="seq attn", color="green")
+
         attn_output = self.seq_parallel_send_kv(
             q=query_states, k=key_states, v=value_states
         )
 
+        nvtx.end_range(seq_rng)
+
         attn_output = attn_output.view(bsz, q_len, -1)
 
+        o_rng = nvtx.start_range(message="o projection", color="gray")
+
         attn_output = F.linear(attn_output, self.o_proj)
+
+        nvtx.end_range(o_rng)
+
+        nvtx.end_range(attn_rng)
 
         return attn_output, None, past_key_value
