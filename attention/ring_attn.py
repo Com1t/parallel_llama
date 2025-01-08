@@ -11,6 +11,7 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from xformers.ops.fmha import memory_efficient_attention_partial, merge_attentions
+from xformers.ops import LowerTriangularMask
 from .utils import RingComm
 
 import nvtx
@@ -103,6 +104,7 @@ class RingLlamaAttention(nn.Module):
     ):
         process_group = dist.group.WORLD
         comm = RingComm(process_group)
+        rank = dist.get_rank()
         world_size = comm.world_size
 
         next_k, next_v = None, None
@@ -119,20 +121,25 @@ class RingLlamaAttention(nn.Module):
                 next_v: torch.Tensor = comm.send_recv(v)
                 comm.commit()
 
+            kv_origin = (rank - step) % world_size
+
             seq_sdpa_rng = nvtx.start_range(message="sdpa", color="white")
 
-            out_, lse_ = memory_efficient_attention_partial(q, k, v)
+            if kv_origin == rank:
+                out_, lse_ = memory_efficient_attention_partial(q, k, v, attn_bias=LowerTriangularMask())
+            elif kv_origin < rank:
+                out_, lse_ = memory_efficient_attention_partial(q, k, v)
 
             nvtx.end_range(seq_sdpa_rng)
 
             seq_cache_rng = nvtx.start_range(message="cache append", color="cyan")
 
-            # attn_out is in the shape of [B, M, num of heads, head_dim]
-            o_blocks.append(out_)
+            if kv_origin <= rank:
+                # attn_out is in the shape of [B, M, num of heads, head_dim]
+                o_blocks.append(out_)
 
-            # LSE is in the shape of [B, num of heads, M]
-            lse_values.append(lse_)
-            # print(f"once {torch.cuda.max_memory_allocated() / 1024**2} MB")
+                # LSE is in the shape of [B, num of heads, M]
+                lse_values.append(lse_)
 
             nvtx.end_range(seq_cache_rng)
 
@@ -143,12 +150,15 @@ class RingLlamaAttention(nn.Module):
 
             nvtx.end_range(seq_attn_rng)
 
-        with torch.cuda.device(q.device.index):
-            seq_merge_rng = nvtx.start_range(message="seq attn merging", color="brown")
+        seq_merge_rng = nvtx.start_range(message="seq attn merging", color="brown")
 
-            attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+        if rank > 0:
+            with torch.cuda.device(q.device.index):
+                attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+        else:
+            attn_output = o_blocks[0]
 
-            nvtx.end_range(seq_merge_rng)
+        nvtx.end_range(seq_merge_rng)
 
         return attn_output
 
