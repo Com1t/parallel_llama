@@ -6,7 +6,7 @@ import torch.distributed as dist
 from transformers import LlamaConfig
 from attention import LlamaAttention, RingLlamaAttention
 from torch.profiler import profile, record_function, ProfilerActivity
-
+import time
 
 def init_prof(use_profiler, warmup_iters=2, inf_iters=3):
     activities = []
@@ -71,27 +71,40 @@ def main():
     # Example input and configuration
     batch_size = 1
     seq_len = 4096
+    chunk_len = seq_len // world_size
+    input_tensor = torch.zeros([batch_size, chunk_len, cfg.hidden_size])
+    nn.init.xavier_normal_(input_tensor)
+    position_ids = (
+        torch.arange(chunk_len)
+        .unsqueeze(0)
+        .expand(input_tensor.shape[0], -1)
+    )
+    position_ids += rank * chunk_len
+
+    # ensure every rank has the same input tensor
+    dist.broadcast(input_tensor, src=0)
+
     with torch.no_grad():
         ctx = init_prof(use_profiler, num_warmup_iterations, num_inf_iterations)
         with ctx as prof:
-            for _ in range(num_warmup_iterations + num_inf_iterations):
-                chunk_len = seq_len // world_size
-
-                input_tensor = torch.zeros([batch_size, chunk_len, cfg.hidden_size])
-                nn.init.xavier_normal_(input_tensor)
-                position_ids = (
-                    torch.arange(chunk_len)
-                    .unsqueeze(0)
-                    .expand(input_tensor.shape[0], -1)
-                )
-                position_ids += rank * chunk_len
-
-                # ensure every rank has the same input tensor
-                dist.broadcast(input_tensor, src=0)
+            for itr in range(num_warmup_iterations + num_inf_iterations):
+                if itr >= num_warmup_iterations:
+                    torch.cuda.synchronize()
+                    start_time = time.time()
 
                 parallel_output, _, _ = parallel_attn(
                     input_tensor, position_ids=position_ids
                 )
+
+
+                if itr >= num_warmup_iterations:
+                    torch.cuda.synchronize()
+                    end_time = time.time()
+
+                    print(f"Rank {rank}: Iteration {itr} Time: {(end_time - start_time) * 1000:.3f} ms")
+
+                # To avoid the some ranks going to fast than others
+                time.sleep(1)
 
                 if use_profiler:
                     prof.step()

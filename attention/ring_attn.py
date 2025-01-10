@@ -102,8 +102,7 @@ class RingLlamaAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ):
-        process_group = dist.group.WORLD
-        comm = RingComm(process_group)
+        comm = RingComm(None)
         rank = dist.get_rank()
         world_size = comm.world_size
 

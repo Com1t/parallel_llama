@@ -80,7 +80,7 @@ def main():
     with torch.no_grad():
         ctx = init_prof(use_profiler, num_warmup_iterations, num_inf_iterations)
         with ctx as prof:
-            for _ in range(num_warmup_iterations + num_inf_iterations):
+            for itr in range(num_warmup_iterations + num_inf_iterations):
                 input_tensor = torch.zeros([batch_size, seq_len, cfg.hidden_size])
                 nn.init.xavier_normal_(input_tensor)
                 position_ids = (
@@ -91,9 +91,19 @@ def main():
                 dist.broadcast(input_tensor, src=0)
 
                 # Forward pass on GPU
+                if itr >= num_warmup_iterations:
+                    torch.cuda.synchronize()
+                    start_time = time.time()
+
                 parallel_output, _, _ = parallel_attn(
                     input_tensor, position_ids=position_ids
                 )
+
+                if itr >= num_warmup_iterations:
+                    torch.cuda.synchronize()
+                    end_time = time.time()
+
+                    print(f"Rank {rank}: Iteration {itr} Time: {(end_time - start_time) * 1000:.3f} ms")
 
                 # Verification: Check if the outputs are close
                 if rank == 0:
